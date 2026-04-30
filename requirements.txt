@@ -1,0 +1,15 @@
+# Web框架
+fastapi>=0.100.0
+uvicorn[standard]>=0.23.0
+pydantic>=2.0.0
+
+# Word文档处理
+python-docx>=1.0.0
+
+# HTTP请求
+requests>=2.31.0
+
+# CORS支持（FastAPI内置）
+
+# 生产环境
+gunicorn>=21.0.0
