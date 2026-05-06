@@ -9,7 +9,7 @@ from urllib.parse import urlparse, quote, unquote
 from datetime import datetime, timedelta
 
 import requests
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -34,8 +34,17 @@ file_store = {}
 app = FastAPI(
     title="制式文档生成API",
     description="Word模板占位符替换服务",
-    version="1.2.0-red-table"
+    version="1.2.0-red-table-fix"
 )
+
+# 全局异常捕获（方便看错误）
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    print("❌ 全局错误：", exc)
+    return JSONResponse(
+        status_code=500,
+        content={"detail": f"服务器错误: {str(exc)}"}
+    )
 
 app.add_middleware(
     CORSMiddleware,
@@ -126,19 +135,15 @@ def parse_colored_segments(value):
     segments = []
     pattern = re.compile(r'<red>(.*?)</red>', re.DOTALL)
     last_end = 0
-
     for match in pattern.finditer(value):
         if match.start() > last_end:
             segments.append((value[last_end:match.start()], False))
         segments.append((match.group(1), True))
         last_end = match.end()
-
     if last_end < len(value):
         segments.append((value[last_end:], False))
-
     if not segments:
         segments = [(value, False)]
-
     return segments
 
 
@@ -181,7 +186,7 @@ def set_cell_text(cell, text, bold=False, font_size=10.5, align=WD_ALIGN_PARAGRA
     run._element.rPr.rFonts.set(qn('w:eastAsia'), '宋体')
 
 
-# ======================= 【新增：自动解析 | 分隔文本 → 表格】 =======================
+# ======================= 自动解析 | 分隔文本 → 表格 =======================
 def parse_pipe_table(text):
     lines = [line.strip() for line in text.strip().splitlines() if line.strip()]
     table_data = []
@@ -197,19 +202,14 @@ def is_pipe_table(text):
 
 def replace_placeholder_with_auto_table(doc, placeholder, table_text):
     target_para = None
-    target_idx = None
     body = doc.element.body
-    body_elements = list(body)
-
-    for idx, element in enumerate(body_elements):
+    for element in body:
         if isinstance(element, CT_P):
             para = Paragraph(element, doc)
             full_text = "".join(run.text for run in para.runs)
             if placeholder in full_text:
                 target_para = para
-                target_idx = idx
                 break
-
     if target_para is None:
         return False
 
@@ -247,18 +247,15 @@ def build_research_table(doc, table_data):
     headers = ['序号', '原计划研发内容', '实际完成情况', '完成度', '未完成原因及说明']
     table = doc.add_table(rows=1 + len(table_data), cols=len(headers))
     table.style = 'Table Grid'
-
     col_widths = [Inches(0.8), Inches(2.5), Inches(1.5), Inches(1.0), Inches(2.0)]
     for col_idx, width in enumerate(col_widths):
         for row in table.rows:
             row.cells[col_idx].width = width
-
     for col_idx, header in enumerate(headers):
         cell = table.cell(0, col_idx)
         set_cell_background(cell, 'D9E1F2')
         set_cell_border(cell)
         set_cell_text(cell, header, bold=True)
-
     for row_idx, row_data in enumerate(table_data):
         for col_idx, value in enumerate(row_data):
             cell = table.cell(row_idx + 1, col_idx)
@@ -271,22 +268,16 @@ def build_research_table(doc, table_data):
 
 def replace_placeholder_with_table(doc, placeholder, table_data):
     target_para = None
-    target_idx = None
     body = doc.element.body
-    body_elements = list(body)
-
-    for idx, element in enumerate(body_elements):
+    for element in body:
         if isinstance(element, CT_P):
             para = Paragraph(element, doc)
             full_text = "".join(run.text for run in para.runs)
             if placeholder in full_text:
                 target_para = para
-                target_idx = idx
                 break
-
     if target_para is None:
         return False
-
     tmp_doc = Document()
     tmp_table = build_research_table(tmp_doc, table_data)
     tbl_element = tmp_table._tbl
@@ -303,7 +294,6 @@ def process_paragraph(paragraph, keys, values):
     original_text = para_info["text"]
     if not original_text:
         return
-
     has_placeholder = False
     for key in keys:
         if re.search(r'\{\{\s*' + re.escape(key) + r'\s*\}\}', original_text):
@@ -311,7 +301,6 @@ def process_paragraph(paragraph, keys, values):
             break
     if not has_placeholder:
         return
-
     new_text = replace_placeholders_in_text(original_text, keys, values)
     if new_text == original_text:
         return
@@ -328,13 +317,11 @@ def process_paragraph(paragraph, keys, values):
                 current_run.add_break()
                 current_run.text += line
         apply_formatting_to_run(current_run, para_info["formatting"])
-
     else:
         formatting = para_info["formatting"]
         p_elem = paragraph._p
         for run in paragraph.runs:
             p_elem.remove(run._r)
-
         lines = new_text.split('\n')
         for line_idx, line in enumerate(lines):
             segments = parse_colored_segments(line)
@@ -343,14 +330,12 @@ def process_paragraph(paragraph, keys, values):
                     continue
                 new_run = OxmlElement('w:r')
                 rPr = OxmlElement('w:rPr')
-
                 if formatting.get("font.name"):
                     rFonts = OxmlElement('w:rFonts')
                     rFonts.set(qn('w:ascii'), formatting["font.name"])
                     rFonts.set(qn('w:hAnsi'), formatting["font.name"])
                     rFonts.set(qn('w:eastAsia'), formatting["font.name"])
                     rPr.append(rFonts)
-
                 if formatting.get("bold"):
                     rPr.append(OxmlElement('w:b'))
                 if formatting.get("italic"):
@@ -359,7 +344,6 @@ def process_paragraph(paragraph, keys, values):
                     u = OxmlElement('w:u')
                     u.set(qn('w:val'), 'single')
                     rPr.append(u)
-
                 if formatting.get("font.size"):
                     try:
                         sz_val = str(int(formatting["font.size"].pt * 2))
@@ -371,7 +355,6 @@ def process_paragraph(paragraph, keys, values):
                         rPr.append(szCs)
                     except Exception:
                         pass
-
                 color_elem = OxmlElement('w:color')
                 if is_red:
                     color_elem.set(qn('w:val'), 'FF0000')
@@ -381,14 +364,12 @@ def process_paragraph(paragraph, keys, values):
                     color_elem.set(qn('w:val'), 'auto')
                 rPr.append(color_elem)
                 new_run.append(rPr)
-
                 t_elem = OxmlElement('w:t')
                 t_elem.text = seg_text
                 if seg_text.startswith(' ') or seg_text.endswith(' '):
                     t_elem.set('{http://www.w3.org/XML/1998/namespace}space', 'preserve')
                 new_run.append(t_elem)
                 p_elem.append(new_run)
-
             if line_idx < len(lines) - 1:
                 br_run = OxmlElement('w:r')
                 br = OxmlElement('w:br')
@@ -404,32 +385,26 @@ def process_table(table, keys, values):
 
 
 def process_document(doc, keys, values):
-    # 自动识别 | 表格文本 并替换
+    # 自动表格
     auto_table_key = "性能指标表格"
     auto_table_idx = None
-
     for i, key in enumerate(keys):
         if key == auto_table_key:
             auto_table_idx = i
             break
-
     if auto_table_idx is not None:
         table_text = values[auto_table_idx]
         if is_pipe_table(table_text):
             replace_placeholder_with_auto_table(doc, f"{{{{{auto_table_key}}}}}", table_text)
             keys = [k for i, k in enumerate(keys) if i != auto_table_idx]
             values = [v for i, v in enumerate(values) if i != auto_table_idx]
-
-    # 原有研发内容表格逻辑
+    # 研发内容表格
     table_placeholder = '研发内容完成情况'
     table_data_key_idx = None
-    table_data = None
-
     for i, key in enumerate(keys):
         if key == table_placeholder:
             table_data_key_idx = i
             break
-
     if table_data_key_idx is not None:
         raw_value = values[table_data_key_idx]
         try:
@@ -440,13 +415,11 @@ def process_document(doc, keys, values):
             replace_placeholder_with_table(doc, f'{{{{{table_placeholder}}}}}', table_data)
             keys = [k for i, k in enumerate(keys) if i != table_data_key_idx]
             values = [v for i, v in enumerate(values) if i != table_data_key_idx]
-
     # 普通文本
     for element in doc.element.body:
         if isinstance(element, CT_P):
             paragraph = Paragraph(element, doc)
             process_paragraph(paragraph, keys, values)
-
     for table in doc.tables:
         process_table(table, keys, values)
 
@@ -467,7 +440,7 @@ def generate_filename(original_url, custom_filename=None):
 
 @app.get("/")
 async def root():
-    return {"service": "制式文档生成API", "version": "1.2.0-red-table", "status": "running"}
+    return {"service": "制式文档生成API", "version": "1.2.0-red-table-fix", "status": "running"}
 
 
 @app.get("/health")
@@ -533,7 +506,7 @@ async def generate_document(request: GenerateRequest):
 
 @app.get("/download/{filename}")
 async def download_file_endpoint(filename: str):
-    filename = os.basename(filename)
+    filename = os.path.basename(filename)
     if filename in file_store:
         item = file_store[filename]
         if datetime.now() < item["expires"]:
