@@ -26,7 +26,7 @@ from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.enum.table import WD_ALIGN_VERTICAL
 
 HOST = os.environ.get("HOST", "0.0.0.0")
-PORT = int(os.environ.get("PORT", "8000"))
+PORT = int(os.environ.get("PORT", 8000))
 BASE_URL = os.environ.get("BASE_URL", f"http://localhost:{PORT}")
 
 file_store = {}
@@ -34,7 +34,7 @@ file_store = {}
 app = FastAPI(
     title="制式文档生成API",
     description="Word模板占位符替换服务",
-    version="1.2.0"
+    version="1.2.0-red-table"
 )
 
 app.add_middleware(
@@ -123,13 +123,6 @@ def apply_formatting_to_run(run, formatting):
 
 
 def parse_colored_segments(value):
-    """
-    解析 <red>文字</red> 标记
-    返回 [(文字, is_red), ...]
-    示例：
-        "hello <red>世界</red> end"
-        → [("hello ", False), ("世界", True), (" end", False)]
-    """
     segments = []
     pattern = re.compile(r'<red>(.*?)</red>', re.DOTALL)
     last_end = 0
@@ -150,12 +143,10 @@ def parse_colored_segments(value):
 
 
 def has_color_tag(text):
-    """判断文本中是否含有<red>标签"""
     return '<red>' in text and '</red>' in text
 
 
 def set_cell_border(cell):
-    """设置单元格边框"""
     tc = cell._tc
     tcPr = tc.get_or_add_tcPr()
     tcBorders = OxmlElement('w:tcBorders')
@@ -170,7 +161,6 @@ def set_cell_border(cell):
 
 
 def set_cell_background(cell, color):
-    """设置单元格背景色"""
     tc = cell._tc
     tcPr = tc.get_or_add_tcPr()
     shd = OxmlElement('w:shd')
@@ -181,7 +171,6 @@ def set_cell_background(cell, color):
 
 
 def set_cell_text(cell, text, bold=False, font_size=10.5, align=WD_ALIGN_PARAGRAPH.CENTER):
-    """设置单元格文字"""
     cell.vertical_alignment = WD_ALIGN_VERTICAL.CENTER
     para = cell.paragraphs[0]
     para.alignment = align
@@ -192,18 +181,70 @@ def set_cell_text(cell, text, bold=False, font_size=10.5, align=WD_ALIGN_PARAGRA
     run._element.rPr.rFonts.set(qn('w:eastAsia'), '宋体')
 
 
-def build_research_table(doc, table_data):
-    """
-    构建研发内容完成情况表格
-    table_data 格式:
-    [
-        ['内容1', '高吸附容量分子筛材料研发', '已完成', '100%', '—'],
-        ['内容2', '低能耗催化燃烧工艺优化',   '已完成', '100%', '—'],
-        ...
-    ]
-    """
-    headers = ['序号', '原计划研发内容', '实际完成情况', '完成度', '未完成原因及说明']
+# ======================= 【新增：自动解析 | 分隔文本 → 表格】 =======================
+def parse_pipe_table(text):
+    lines = [line.strip() for line in text.strip().splitlines() if line.strip()]
+    table_data = []
+    for line in lines:
+        row = [cell.strip() for cell in line.split('|')]
+        table_data.append(row)
+    return table_data
 
+
+def is_pipe_table(text):
+    return '|' in text.strip() and len(text.strip().splitlines()) > 1
+
+
+def replace_placeholder_with_auto_table(doc, placeholder, table_text):
+    target_para = None
+    target_idx = None
+    body = doc.element.body
+    body_elements = list(body)
+
+    for idx, element in enumerate(body_elements):
+        if isinstance(element, CT_P):
+            para = Paragraph(element, doc)
+            full_text = "".join(run.text for run in para.runs)
+            if placeholder in full_text:
+                target_para = para
+                target_idx = idx
+                break
+
+    if target_para is None:
+        return False
+
+    table_data = parse_pipe_table(table_text)
+    if not table_data:
+        return False
+
+    rows = len(table_data)
+    cols = max(len(row) for row in table_data)
+    table = doc.add_table(rows=rows, cols=cols)
+    table.style = 'Table Grid'
+
+    for r_idx, row in enumerate(table_data):
+        for c_idx, cell_text in enumerate(row):
+            if c_idx >= len(table.rows[r_idx].cells):
+                continue
+            cell = table.cell(r_idx, c_idx)
+            set_cell_border(cell)
+            if r_idx == 0:
+                set_cell_background(cell, 'E6E6E6')
+                set_cell_text(cell, cell_text, bold=True)
+            else:
+                if r_idx % 2 == 1:
+                    set_cell_background(cell, 'F5F5F5')
+                set_cell_text(cell, cell_text, bold=False)
+
+    target_para._element.addprevious(table._tbl)
+    parent = target_para._element.getparent()
+    parent.remove(target_para._element)
+    return True
+# ================================================================================
+
+
+def build_research_table(doc, table_data):
+    headers = ['序号', '原计划研发内容', '实际完成情况', '完成度', '未完成原因及说明']
     table = doc.add_table(rows=1 + len(table_data), cols=len(headers))
     table.style = 'Table Grid'
 
@@ -225,17 +266,12 @@ def build_research_table(doc, table_data):
             if row_idx % 2 == 1:
                 set_cell_background(cell, 'F2F2F2')
             set_cell_text(cell, value)
-
     return table
 
 
 def replace_placeholder_with_table(doc, placeholder, table_data):
-    """
-    找到含占位符的段落，替换为真实表格
-    """
     target_para = None
     target_idx = None
-
     body = doc.element.body
     body_elements = list(body)
 
@@ -254,12 +290,9 @@ def replace_placeholder_with_table(doc, placeholder, table_data):
     tmp_doc = Document()
     tmp_table = build_research_table(tmp_doc, table_data)
     tbl_element = tmp_table._tbl
-
     target_para._element.addprevious(tbl_element)
-
     parent = target_para._element.getparent()
     parent.remove(target_para._element)
-
     return True
 
 
@@ -271,7 +304,6 @@ def process_paragraph(paragraph, keys, values):
     if not original_text:
         return
 
-    # 检查是否有占位符
     has_placeholder = False
     for key in keys:
         if re.search(r'\{\{\s*' + re.escape(key) + r'\s*\}\}', original_text):
@@ -280,16 +312,11 @@ def process_paragraph(paragraph, keys, values):
     if not has_placeholder:
         return
 
-    # 替换后的文本
     new_text = replace_placeholders_in_text(original_text, keys, values)
     if new_text == original_text:
         return
 
-    # ============================================
-    # 判断是否需要处理红色标签
-    # ============================================
     if not has_color_tag(new_text):
-        # ✅ 原来的逻辑：没有红色标签，直接替换
         for run in paragraph.runs:
             run.text = ""
         lines = new_text.split('\n')
@@ -303,32 +330,20 @@ def process_paragraph(paragraph, keys, values):
         apply_formatting_to_run(current_run, para_info["formatting"])
 
     else:
-        # ✅ 新逻辑：含有<red>标签，拆分成多个run
         formatting = para_info["formatting"]
-
-        # 清空所有现有runs
         p_elem = paragraph._p
         for run in paragraph.runs:
             p_elem.remove(run._r)
 
-        # 按换行拆分
         lines = new_text.split('\n')
-
         for line_idx, line in enumerate(lines):
-            # 每行解析红色片段
             segments = parse_colored_segments(line)
-
             for seg_text, is_red in segments:
                 if not seg_text:
                     continue
-
-                # 创建新run
                 new_run = OxmlElement('w:r')
-
-                # 复制格式 rPr
                 rPr = OxmlElement('w:rPr')
 
-                # 字体
                 if formatting.get("font.name"):
                     rFonts = OxmlElement('w:rFonts')
                     rFonts.set(qn('w:ascii'), formatting["font.name"])
@@ -336,27 +351,18 @@ def process_paragraph(paragraph, keys, values):
                     rFonts.set(qn('w:eastAsia'), formatting["font.name"])
                     rPr.append(rFonts)
 
-                # 加粗
                 if formatting.get("bold"):
-                    bold_elem = OxmlElement('w:b')
-                    rPr.append(bold_elem)
-
-                # 斜体
+                    rPr.append(OxmlElement('w:b'))
                 if formatting.get("italic"):
-                    italic_elem = OxmlElement('w:i')
-                    rPr.append(italic_elem)
-
-                # 下划线
+                    rPr.append(OxmlElement('w:i'))
                 if formatting.get("underline"):
-                    u_elem = OxmlElement('w:u')
-                    u_elem.set(qn('w:val'), 'single')
-                    rPr.append(u_elem)
+                    u = OxmlElement('w:u')
+                    u.set(qn('w:val'), 'single')
+                    rPr.append(u)
 
-                # 字号
                 if formatting.get("font.size"):
                     try:
-                        font_size = formatting["font.size"]
-                        sz_val = str(int(font_size.pt * 2))
+                        sz_val = str(int(formatting["font.size"].pt * 2))
                         sz = OxmlElement('w:sz')
                         sz.set(qn('w:val'), sz_val)
                         rPr.append(sz)
@@ -366,7 +372,6 @@ def process_paragraph(paragraph, keys, values):
                     except Exception:
                         pass
 
-                # 颜色：红色 or 原色
                 color_elem = OxmlElement('w:color')
                 if is_red:
                     color_elem.set(qn('w:val'), 'FF0000')
@@ -375,22 +380,15 @@ def process_paragraph(paragraph, keys, values):
                 else:
                     color_elem.set(qn('w:val'), 'auto')
                 rPr.append(color_elem)
-
                 new_run.append(rPr)
 
-                # 文字内容
                 t_elem = OxmlElement('w:t')
                 t_elem.text = seg_text
-                # 保留首尾空格
                 if seg_text.startswith(' ') or seg_text.endswith(' '):
-                    t_elem.set(
-                        '{http://www.w3.org/XML/1998/namespace}space',
-                        'preserve'
-                    )
+                    t_elem.set('{http://www.w3.org/XML/1998/namespace}space', 'preserve')
                 new_run.append(t_elem)
                 p_elem.append(new_run)
 
-            # 换行处理（非最后一行）
             if line_idx < len(lines) - 1:
                 br_run = OxmlElement('w:r')
                 br = OxmlElement('w:br')
@@ -406,14 +404,23 @@ def process_table(table, keys, values):
 
 
 def process_document(doc, keys, values):
-    """
-    处理文档：
-    1. 先处理表格类占位符（替换为真实表格）
-    2. 再处理普通文本占位符
-    """
-    # =============================
-    # ✅ 第一步：处理需要转表格的占位符
-    # =============================
+    # 自动识别 | 表格文本 并替换
+    auto_table_key = "性能指标表格"
+    auto_table_idx = None
+
+    for i, key in enumerate(keys):
+        if key == auto_table_key:
+            auto_table_idx = i
+            break
+
+    if auto_table_idx is not None:
+        table_text = values[auto_table_idx]
+        if is_pipe_table(table_text):
+            replace_placeholder_with_auto_table(doc, f"{{{{{auto_table_key}}}}}", table_text)
+            keys = [k for i, k in enumerate(keys) if i != auto_table_idx]
+            values = [v for i, v in enumerate(values) if i != auto_table_idx]
+
+    # 原有研发内容表格逻辑
     table_placeholder = '研发内容完成情况'
     table_data_key_idx = None
     table_data = None
@@ -429,15 +436,12 @@ def process_document(doc, keys, values):
             table_data = json.loads(raw_value)
         except Exception:
             table_data = None
-
         if table_data:
             replace_placeholder_with_table(doc, f'{{{{{table_placeholder}}}}}', table_data)
             keys = [k for i, k in enumerate(keys) if i != table_data_key_idx]
             values = [v for i, v in enumerate(values) if i != table_data_key_idx]
 
-    # =============================
-    # ✅ 第二步：处理普通文本占位符
-    # =============================
+    # 普通文本
     for element in doc.element.body:
         if isinstance(element, CT_P):
             paragraph = Paragraph(element, doc)
@@ -463,7 +467,7 @@ def generate_filename(original_url, custom_filename=None):
 
 @app.get("/")
 async def root():
-  return {"service": "制式文档生成API", "version": "1.2.0-red", "status": "running"}
+    return {"service": "制式文档生成API", "version": "1.2.0-red-table", "status": "running"}
 
 
 @app.get("/health")
@@ -529,8 +533,7 @@ async def generate_document(request: GenerateRequest):
 
 @app.get("/download/{filename}")
 async def download_file_endpoint(filename: str):
-    filename = os.path.basename(filename)
-
+    filename = os.basename(filename)
     if filename in file_store:
         item = file_store[filename]
         if datetime.now() < item["expires"]:
@@ -544,7 +547,6 @@ async def download_file_endpoint(filename: str):
         else:
             del file_store[filename]
             raise HTTPException(status_code=404, detail="文件已过期")
-
     raise HTTPException(status_code=404, detail="文件不存在")
 
 
