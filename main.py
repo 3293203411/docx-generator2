@@ -1,149 +1,120 @@
-# -*- coding: utf-8 -*-
-import os
 import re
-import uuid
-import json
-from typing import Optional
-from urllib.parse import quote
-from datetime import datetime, timedelta
-import io
+from docx.enum.text import WD_ALIGN_PARAGRAPH
 
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+def is_markdown_table(text):
+    """判断是否为标准 Markdown 表格格式"""
+    if not text or '|' not in text:
+        return False
+    lines = [l.strip() for l in text.strip().splitlines() if l.strip()]
+    if len(lines) < 3:
+        return False
+    # 检查第二行是否为分隔符行（仅允许 |, -, :, 空格）
+    sep_line = lines[1].strip('|')
+    return bool(re.match(r'^[\s|:-]+$', sep_line))
 
-# htmldocx 用于把 HTML 直接转 Word
-from htmldocx import HtmlToDocx
-
-HOST = os.environ.get("HOST", "0.0.0.0")
-PORT = int(os.environ.get("PORT", 8000))
-BASE_URL = os.environ.get("BASE_URL", f"http://localhost:{PORT}")
-
-# 内存文件存储（2小时过期）
-file_store = {}
-
-app = FastAPI(
-    title="HTML转Word文档API",
-    description="输入HTML代码，直接返回Word下载链接",
-    version="2.0.0-html-to-word"
-)
-
-# 全局异常捕获
-@app.exception_handler(Exception)
-async def global_exception_handler(request: Request, exc: Exception):
-    print("❌ 全局错误：", exc)
-    return JSONResponse(
-        status_code=500,
-        content={"detail": f"服务器错误: {str(exc)}"}
-    )
-
-# 跨域
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# ====================== 请求模型 ======================
-class HtmlToWordRequest(BaseModel):
-    html_content: str                # 你的 HTML 代码
-    filename: Optional[str] = None   # 自定义文件名
-
-
-# ====================== 核心：HTML → Word ======================
-def html_to_word_bytes(html_content: str) -> bytes:
-    """把 HTML 直接转换成 docx 字节流"""
-    parser = HtmlToDocx()
+def parse_markdown_table(text):
+    """解析 Markdown 表格，返回 (headers, alignments, data_rows)"""
+    lines = [l.strip() for l in text.strip().splitlines() if l.strip()]
     
-    # 生成空白文档 + 写入 HTML
-    doc = parser.parse_html_string(html_content)
+    def split_row(line):
+        return [cell.strip() for cell in line.strip('|').split('|')]
+
+    headers = split_row(lines[0])
+    sep_parts = split_row(lines[1])
     
-    # 保存到内存
-    buffer = io.BytesIO()
-    doc.save(buffer)
-    buffer.seek(0)
-    return buffer.read()
+    # 提取每列对齐方式
+    alignments = []
+    for part in sep_parts:
+        part = part.strip()
+        if part.startswith(':') and part.endswith(':'):
+            alignments.append(WD_ALIGN_PARAGRAPH.CENTER)
+        elif part.endswith(':'):
+            alignments.append(WD_ALIGN_PARAGRAPH.RIGHT)
+        else:
+            alignments.append(WD_ALIGN_PARAGRAPH.LEFT)
+            
+    data_rows = [split_row(line) for line in lines[2:]]
+    return headers, alignments, data_rows
 
+def replace_placeholder_with_auto_table(doc, placeholder, table_text):
+    """将占位符段落替换为 Markdown 解析后的 Word 表格"""
+    target_para = None
+    body = doc.element.body
+    for element in body:
+        if isinstance(element, CT_P):
+            para = Paragraph(element, doc)
+            if placeholder in "".join(run.text for run in para.runs):
+                target_para = para
+                break
+    if target_para is None:
+        return False
 
-# ====================== 生成文件名 ======================
-def generate_filename(custom_name=None):
-    if custom_name:
-        name = custom_name.replace(".docx", "")
-        return f"{name}.docx"
-    return f"html_word_{uuid.uuid4().hex[:8]}.docx"
+    headers, alignments, data_rows = parse_markdown_table(table_text)
+    if not headers or not data_rows:
+        return False
 
+    cols_count = len(headers)
+    rows_count = len(data_rows) + 1  # +1 表头
+    table = doc.add_table(rows=rows_count, cols=cols_count)
+    table.style = 'Table Grid'
 
-# ====================== 接口 ======================
-@app.get("/")
-async def root():
-    return {"service": "HTML转Word文档API", "version": "2.0.0", "status": "running"}
+    # 1. 填充表头
+    for c_idx, header_text in enumerate(headers):
+        cell = table.cell(0, c_idx)
+        set_cell_border(cell)
+        set_cell_background(cell, 'E6E6E6')
+        align = alignments[c_idx] if c_idx < len(alignments) else WD_ALIGN_PARAGRAPH.LEFT
+        set_cell_text(cell, header_text, bold=True, align=align)
 
-@app.get("/health")
-async def health_check():
-    return {"status": "healthy"}
+    # 2. 填充数据行
+    for r_idx, row_data in enumerate(data_rows, start=1):
+        # 补齐或截断单元格数量，防止越界
+        row_data = row_data[:cols_count]
+        row_data += [''] * (cols_count - len(row_data))
+        
+        for c_idx, cell_text in enumerate(row_data):
+            cell = table.cell(r_idx, c_idx)
+            set_cell_border(cell)
+            if r_idx % 2 == 0:  # 偶数行斑马纹
+                set_cell_background(cell, 'F5F5F5')
+            align = alignments[c_idx] if c_idx < len(alignments) else WD_ALIGN_PARAGRAPH.LEFT
+            set_cell_text(cell, cell_text, bold=False, align=align)
 
-@app.post("/generate")
-async def generate_document(request: HtmlToWordRequest):
-    try:
-        html = request.html_content.strip()
-        if not html:
-            raise HTTPException(status_code=400, detail="HTML 内容不能为空")
+    # 3. 插入表格并移除原占位符段落
+    target_para._element.addprevious(table._tbl)
+    parent = target_para._element.getparent()
+    parent.remove(target_para._element)
+    return True
 
-        # 1. HTML → Word
-        word_bytes = html_to_word_bytes(html)
+def process_document(doc, keys, values):
+    # ================= 自动识别并转换任意 Markdown 表格 =================
+    new_keys, new_values = [], []
+    for k, v in zip(keys, values):
+        # 如果值符合 Markdown 表格特征，则自动转换，不再作为普通文本处理
+        if is_markdown_table(v):
+            placeholder = f"{{{{{k}}}}}"
+            if replace_placeholder_with_auto_table(doc, placeholder, v):
+                continue  # 转换成功，跳过
+        new_keys.append(k)
+        new_values.append(v)
+    keys, values = new_keys, new_values
 
-        # 2. 生成文件名
-        real_filename = generate_filename(request.filename)
-        encoded_filename = quote(real_filename, encoding="utf-8")
+    # ================= 研发内容表格 (JSON格式，保留原逻辑) =================
+    table_placeholder = '研发内容完成情况'
+    table_data_key_idx = next((i for i, k in enumerate(keys) if k == table_placeholder), None)
+    if table_data_key_idx is not None:
+        try:
+            table_data = json.loads(values[table_data_key_idx])
+            if isinstance(table_data, list):
+                replace_placeholder_with_table(doc, f'{{{{{table_placeholder}}}}}', table_data)
+                keys.pop(table_data_key_idx)
+                values.pop(table_data_key_idx)
+        except Exception:
+            pass
 
-        # 3. 存入内存（2小时过期）
-        file_store[encoded_filename] = {
-            "data": word_bytes,
-            "expires": datetime.now() + timedelta(hours=2),
-            "real_name": real_filename
-        }
-
-        # 4. 返回下载链接
-        download_url = f"{BASE_URL}/download/{encoded_filename}"
-
-        return {
-            "success": True,
-            "message": "HTML 转 Word 成功",
-            "download_url": download_url,
-            "filename": real_filename
-        }
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"转换失败: {str(e)}")
-
-
-@app.get("/download/{filename}")
-async def download_file_endpoint(filename: str):
-    filename = os.path.basename(filename)
-    if filename not in file_store:
-        raise HTTPException(status_code=404, detail="文件不存在")
-
-    item = file_store[filename]
-    if datetime.now() >= item["expires"]:
-        del file_store[filename]
-        raise HTTPException(status_code=404, detail="文件已过期")
-
-    real_name = item["real_name"]
-    return JSONResponse(
-        content=item["data"],
-        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        headers={
-            "Content-Disposition": f"attachment; filename*=utf-8''{quote(real_name)}"
-        }
-    )
-
-
-def start_server():
-    import uvicorn
-    uvicorn.run(app, host=HOST, port=PORT)
-
-if __name__ == "__main__":
-    start_server()
+    # ================= 普通文本替换 =================
+    for element in doc.element.body:
+        if isinstance(element, CT_P):
+            process_paragraph(Paragraph(element, doc), keys, values)
+    for table in doc.tables:
+        process_table(table, keys, values)
