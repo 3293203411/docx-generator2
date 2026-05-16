@@ -3,41 +3,33 @@ import os
 import re
 import uuid
 import json
-import base64
-from typing import List, Optional, Union
-from urllib.parse import urlparse, quote, unquote
+from typing import Optional
+from urllib.parse import quote
 from datetime import datetime, timedelta
+import io
 
-import requests
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from docx import Document
-from docx.text.paragraph import Paragraph
-from docx.table import Table
-from docx.oxml.text.paragraph import CT_P
-from docx.oxml.table import CT_Tc, CT_Tbl
-from docx.oxml.shared import qn
-from docx.oxml import OxmlElement
-from docx.shared import Pt, Inches, RGBColor
-from docx.enum.text import WD_ALIGN_PARAGRAPH
-from docx.enum.table import WD_ALIGN_VERTICAL
+# htmldocx 用于把 HTML 直接转 Word
+from htmldocx import HtmlToDocx
 
 HOST = os.environ.get("HOST", "0.0.0.0")
 PORT = int(os.environ.get("PORT", 8000))
 BASE_URL = os.environ.get("BASE_URL", f"http://localhost:{PORT}")
 
+# 内存文件存储（2小时过期）
 file_store = {}
 
 app = FastAPI(
-    title="制式文档生成API",
-    description="Word模板占位符替换服务",
-    version="1.2.0-red-table-fix"
+    title="HTML转Word文档API",
+    description="输入HTML代码，直接返回Word下载链接",
+    version="2.0.0-html-to-word"
 )
 
-# 全局异常捕获（方便看错误）
+# 全局异常捕获
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
     print("❌ 全局错误：", exc)
@@ -46,6 +38,7 @@ async def global_exception_handler(request: Request, exc: Exception):
         content={"detail": f"服务器错误: {str(exc)}"}
     )
 
+# 跨域
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -54,479 +47,103 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
-class GenerateRequest(BaseModel):
-    template_file_url: str = "https://raw.githubusercontent.com/3293203411/docx-generator/main/gaoqilixiangmoban.docx"
-    text_keys: Union[List[str], str]
-    text_values: Union[List[str], str]
-    filename: Optional[str] = None
+# ====================== 请求模型 ======================
+class HtmlToWordRequest(BaseModel):
+    html_content: str                # 你的 HTML 代码
+    filename: Optional[str] = None   # 自定义文件名
 
 
-def parse_json_param(param):
-    if param is None:
-        return []
-    if isinstance(param, list):
-        return [str(item) for item in param]
-    if isinstance(param, str):
-        try:
-            parsed = json.loads(param)
-            if isinstance(parsed, list):
-                return [str(item) for item in parsed]
-            return [str(parsed)]
-        except json.JSONDecodeError:
-            return [param]
-    return [str(param)]
+# ====================== 核心：HTML → Word ======================
+def html_to_word_bytes(html_content: str) -> bytes:
+    """把 HTML 直接转换成 docx 字节流"""
+    parser = HtmlToDocx()
+    
+    # 生成空白文档 + 写入 HTML
+    doc = parser.parse_html_string(html_content)
+    
+    # 保存到内存
+    buffer = io.BytesIO()
+    doc.save(buffer)
+    buffer.seek(0)
+    return buffer.read()
 
 
-def download_file(url: str) -> bytes:
-    try:
-        headers = {'User-Agent': 'Mozilla/5.0'}
-        response = requests.get(url, headers=headers, timeout=60)
-        response.raise_for_status()
-        return response.content
-    except requests.exceptions.RequestException as e:
-        raise HTTPException(status_code=400, detail=f"下载模板文件失败: {str(e)}")
+# ====================== 生成文件名 ======================
+def generate_filename(custom_name=None):
+    if custom_name:
+        name = custom_name.replace(".docx", "")
+        return f"{name}.docx"
+    return f"html_word_{uuid.uuid4().hex[:8]}.docx"
 
 
-def merge_runs_in_paragraph(paragraph):
-    if not paragraph.runs:
-        return {"text": "", "runs": [], "formatting": None}
-    full_text = ""
-    for run in paragraph.runs:
-        full_text += run.text if run.text else ""
-    first_run = paragraph.runs[0]
-    formatting = {
-        "bold": first_run.bold,
-        "italic": first_run.italic,
-        "underline": first_run.underline,
-        "font.name": first_run.font.name,
-        "font.size": first_run.font.size,
-        "font.color.rgb": first_run.font.color.rgb if first_run.font.color and first_run.font.color.rgb else None,
-    }
-    return {"text": full_text, "runs": list(paragraph.runs), "formatting": formatting}
-
-
-def replace_placeholders_in_text(text, keys, values):
-    result = text
-    for key, value in zip(keys, values):
-        pattern = r'\{\{\s*' + re.escape(key) + r'\s*\}\}'
-        result = re.sub(pattern, str(value), result)
-    return result
-
-
-def apply_formatting_to_run(run, formatting):
-    if formatting is None:
-        return
-    if formatting.get("bold") is not None:
-        run.bold = formatting["bold"]
-    if formatting.get("italic") is not None:
-        run.italic = formatting["italic"]
-    if formatting.get("underline") is not None:
-        run.underline = formatting["underline"]
-    if formatting.get("font.name"):
-        run.font.name = formatting["font.name"]
-    if formatting.get("font.size"):
-        run.font.size = formatting["font.size"]
-    if formatting.get("font.color.rgb"):
-        run.font.color.rgb = formatting["font.color.rgb"]
-
-
-def parse_colored_segments(value):
-    segments = []
-    pattern = re.compile(r'<red>(.*?)</red>', re.DOTALL)
-    last_end = 0
-    for match in pattern.finditer(value):
-        if match.start() > last_end:
-            segments.append((value[last_end:match.start()], False))
-        segments.append((match.group(1), True))
-        last_end = match.end()
-    if last_end < len(value):
-        segments.append((value[last_end:], False))
-    if not segments:
-        segments = [(value, False)]
-    return segments
-
-
-def has_color_tag(text):
-    return '<red>' in text and '</red>' in text
-
-
-def set_cell_border(cell):
-    tc = cell._tc
-    tcPr = tc.get_or_add_tcPr()
-    tcBorders = OxmlElement('w:tcBorders')
-    for border_name in ['top', 'left', 'bottom', 'right']:
-        border = OxmlElement(f'w:{border_name}')
-        border.set(qn('w:val'), 'single')
-        border.set(qn('w:sz'), '4')
-        border.set(qn('w:space'), '0')
-        border.set(qn('w:color'), '000000')
-        tcBorders.append(border)
-    tcPr.append(tcBorders)
-
-
-def set_cell_background(cell, color):
-    tc = cell._tc
-    tcPr = tc.get_or_add_tcPr()
-    shd = OxmlElement('w:shd')
-    shd.set(qn('w:val'), 'clear')
-    shd.set(qn('w:color'), 'auto')
-    shd.set(qn('w:fill'), color)
-    tcPr.append(shd)
-
-
-def set_cell_text(cell, text, bold=False, font_size=10.5, align=WD_ALIGN_PARAGRAPH.CENTER):
-    cell.vertical_alignment = WD_ALIGN_VERTICAL.CENTER
-    para = cell.paragraphs[0]
-    para.alignment = align
-    run = para.add_run(text)
-    run.bold = bold
-    run.font.size = Pt(font_size)
-    run.font.name = '宋体'
-    run._element.rPr.rFonts.set(qn('w:eastAsia'), '宋体')
-
-
-# ======================= 自动解析 | 分隔文本 → 表格 =======================
-def parse_pipe_table(text):
-    lines = [line.strip() for line in text.strip().splitlines() if line.strip()]
-    table_data = []
-    for line in lines:
-        row = [cell.strip() for cell in line.split('|')]
-        table_data.append(row)
-    return table_data
-
-
-def is_pipe_table(text):
-    return '|' in text.strip() and len(text.strip().splitlines()) > 1
-
-
-def replace_placeholder_with_auto_table(doc, placeholder, table_text):
-    target_para = None
-    body = doc.element.body
-    for element in body:
-        if isinstance(element, CT_P):
-            para = Paragraph(element, doc)
-            full_text = "".join(run.text for run in para.runs)
-            if placeholder in full_text:
-                target_para = para
-                break
-    if target_para is None:
-        return False
-
-    table_data = parse_pipe_table(table_text)
-    if not table_data:
-        return False
-
-    rows = len(table_data)
-    cols = max(len(row) for row in table_data)
-    table = doc.add_table(rows=rows, cols=cols)
-    table.style = 'Table Grid'
-
-    for r_idx, row in enumerate(table_data):
-        for c_idx, cell_text in enumerate(row):
-            if c_idx >= len(table.rows[r_idx].cells):
-                continue
-            cell = table.cell(r_idx, c_idx)
-            set_cell_border(cell)
-            if r_idx == 0:
-                set_cell_background(cell, 'E6E6E6')
-                set_cell_text(cell, cell_text, bold=True)
-            else:
-                if r_idx % 2 == 1:
-                    set_cell_background(cell, 'F5F5F5')
-                set_cell_text(cell, cell_text, bold=False)
-
-    target_para._element.addprevious(table._tbl)
-    parent = target_para._element.getparent()
-    parent.remove(target_para._element)
-    return True
-# ================================================================================
-
-
-def build_research_table(doc, table_data):
-    headers = ['序号', '原计划研发内容', '实际完成情况', '完成度', '未完成原因及说明']
-    table = doc.add_table(rows=1 + len(table_data), cols=len(headers))
-    table.style = 'Table Grid'
-    col_widths = [Inches(0.8), Inches(2.5), Inches(1.5), Inches(1.0), Inches(2.0)]
-    for col_idx, width in enumerate(col_widths):
-        for row in table.rows:
-            row.cells[col_idx].width = width
-    for col_idx, header in enumerate(headers):
-        cell = table.cell(0, col_idx)
-        set_cell_background(cell, 'D9E1F2')
-        set_cell_border(cell)
-        set_cell_text(cell, header, bold=True)
-    for row_idx, row_data in enumerate(table_data):
-        for col_idx, value in enumerate(row_data):
-            cell = table.cell(row_idx + 1, col_idx)
-            set_cell_border(cell)
-            if row_idx % 2 == 1:
-                set_cell_background(cell, 'F2F2F2')
-            set_cell_text(cell, value)
-    return table
-
-
-def replace_placeholder_with_table(doc, placeholder, table_data):
-    target_para = None
-    body = doc.element.body
-    for element in body:
-        if isinstance(element, CT_P):
-            para = Paragraph(element, doc)
-            full_text = "".join(run.text for run in para.runs)
-            if placeholder in full_text:
-                target_para = para
-                break
-    if target_para is None:
-        return False
-    tmp_doc = Document()
-    tmp_table = build_research_table(tmp_doc, table_data)
-    tbl_element = tmp_table._tbl
-    target_para._element.addprevious(tbl_element)
-    parent = target_para._element.getparent()
-    parent.remove(target_para._element)
-    return True
-
-
-def process_paragraph(paragraph, keys, values):
-    if not paragraph.runs:
-        return
-    para_info = merge_runs_in_paragraph(paragraph)
-    original_text = para_info["text"]
-    if not original_text:
-        return
-    has_placeholder = False
-    for key in keys:
-        if re.search(r'\{\{\s*' + re.escape(key) + r'\s*\}\}', original_text):
-            has_placeholder = True
-            break
-    if not has_placeholder:
-        return
-    new_text = replace_placeholders_in_text(original_text, keys, values)
-    if new_text == original_text:
-        return
-
-    if not has_color_tag(new_text):
-        for run in paragraph.runs:
-            run.text = ""
-        lines = new_text.split('\n')
-        current_run = paragraph.runs[0]
-        for i, line in enumerate(lines):
-            if i == 0:
-                current_run.text = line
-            else:
-                current_run.add_break()
-                current_run.text += line
-        apply_formatting_to_run(current_run, para_info["formatting"])
-    else:
-        formatting = para_info["formatting"]
-        p_elem = paragraph._p
-        for run in paragraph.runs:
-            p_elem.remove(run._r)
-        lines = new_text.split('\n')
-        for line_idx, line in enumerate(lines):
-            segments = parse_colored_segments(line)
-            for seg_text, is_red in segments:
-                if not seg_text:
-                    continue
-                new_run = OxmlElement('w:r')
-                rPr = OxmlElement('w:rPr')
-                if formatting.get("font.name"):
-                    rFonts = OxmlElement('w:rFonts')
-                    rFonts.set(qn('w:ascii'), formatting["font.name"])
-                    rFonts.set(qn('w:hAnsi'), formatting["font.name"])
-                    rFonts.set(qn('w:eastAsia'), formatting["font.name"])
-                    rPr.append(rFonts)
-                if formatting.get("bold"):
-                    rPr.append(OxmlElement('w:b'))
-                if formatting.get("italic"):
-                    rPr.append(OxmlElement('w:i'))
-                if formatting.get("underline"):
-                    u = OxmlElement('w:u')
-                    u.set(qn('w:val'), 'single')
-                    rPr.append(u)
-                if formatting.get("font.size"):
-                    try:
-                        sz_val = str(int(formatting["font.size"].pt * 2))
-                        sz = OxmlElement('w:sz')
-                        sz.set(qn('w:val'), sz_val)
-                        rPr.append(sz)
-                        szCs = OxmlElement('w:szCs')
-                        szCs.set(qn('w:val'), sz_val)
-                        rPr.append(szCs)
-                    except Exception:
-                        pass
-                color_elem = OxmlElement('w:color')
-                if is_red:
-                    color_elem.set(qn('w:val'), 'FF0000')
-                elif formatting.get("font.color.rgb"):
-                    color_elem.set(qn('w:val'), str(formatting["font.color.rgb"]))
-                else:
-                    color_elem.set(qn('w:val'), 'auto')
-                rPr.append(color_elem)
-                new_run.append(rPr)
-                t_elem = OxmlElement('w:t')
-                t_elem.text = seg_text
-                if seg_text.startswith(' ') or seg_text.endswith(' '):
-                    t_elem.set('{http://www.w3.org/XML/1998/namespace}space', 'preserve')
-                new_run.append(t_elem)
-                p_elem.append(new_run)
-            if line_idx < len(lines) - 1:
-                br_run = OxmlElement('w:r')
-                br = OxmlElement('w:br')
-                br_run.append(br)
-                p_elem.append(br_run)
-
-
-def process_table(table, keys, values):
-    for row in table.rows:
-        for cell in row.cells:
-            for paragraph in cell.paragraphs:
-                process_paragraph(paragraph, keys, values)
-
-
-def process_document(doc, keys, values):
-    # 自动表格
-    auto_table_key = "性能指标表格"
-    auto_table_idx = None
-    for i, key in enumerate(keys):
-        if key == auto_table_key:
-            auto_table_idx = i
-            break
-    if auto_table_idx is not None:
-        table_text = values[auto_table_idx]
-        if is_pipe_table(table_text):
-            replace_placeholder_with_auto_table(doc, f"{{{{{auto_table_key}}}}}", table_text)
-            keys = [k for i, k in enumerate(keys) if i != auto_table_idx]
-            values = [v for i, v in enumerate(values) if i != auto_table_idx]
-    # 研发内容表格
-    table_placeholder = '研发内容完成情况'
-    table_data_key_idx = None
-    for i, key in enumerate(keys):
-        if key == table_placeholder:
-            table_data_key_idx = i
-            break
-    if table_data_key_idx is not None:
-        raw_value = values[table_data_key_idx]
-        try:
-            table_data = json.loads(raw_value)
-        except Exception:
-            table_data = None
-        if table_data:
-            replace_placeholder_with_table(doc, f'{{{{{table_placeholder}}}}}', table_data)
-            keys = [k for i, k in enumerate(keys) if i != table_data_key_idx]
-            values = [v for i, v in enumerate(values) if i != table_data_key_idx]
-    # 普通文本
-    for element in doc.element.body:
-        if isinstance(element, CT_P):
-            paragraph = Paragraph(element, doc)
-            process_paragraph(paragraph, keys, values)
-    for table in doc.tables:
-        process_table(table, keys, values)
-
-
-def generate_filename(original_url, custom_filename=None):
-    if custom_filename:
-        if not custom_filename.lower().endswith('.docx'):
-            custom_filename += '.docx'
-        return custom_filename
-    parsed = urlparse(original_url)
-    basename = os.path.basename(parsed.path)
-    if basename and basename.lower().endswith('.docx'):
-        unique_id = uuid.uuid4().hex[:8]
-        name, ext = os.path.splitext(basename)
-        return f"{name}_{unique_id}{ext}"
-    return f"generated_{uuid.uuid4().hex[:8]}.docx"
-
-
+# ====================== 接口 ======================
 @app.get("/")
 async def root():
-    return {"service": "制式文档生成API", "version": "1.2.0-red-table-fix", "status": "running"}
-
+    return {"service": "HTML转Word文档API", "version": "2.0.0", "status": "running"}
 
 @app.get("/health")
 async def health_check():
     return {"status": "healthy"}
 
-
 @app.post("/generate")
-async def generate_document(request: GenerateRequest):
+async def generate_document(request: HtmlToWordRequest):
     try:
-        keys = parse_json_param(request.text_keys)
-        values = parse_json_param(request.text_values)
-        if len(keys) != len(values):
-            raise HTTPException(
-                status_code=400,
-                detail=f"text_keys数量({len(keys)})与text_values数量({len(values)})不匹配"
-            )
-        if not keys:
-            raise HTTPException(status_code=400, detail="text_keys不能为空")
+        html = request.html_content.strip()
+        if not html:
+            raise HTTPException(status_code=400, detail="HTML 内容不能为空")
 
-        file_content = download_file(request.template_file_url)
+        # 1. HTML → Word
+        word_bytes = html_to_word_bytes(html)
 
-        import tempfile
-        temp_input = tempfile.NamedTemporaryFile(delete=False, suffix='.docx')
-        temp_input.write(file_content)
-        temp_input.close()
+        # 2. 生成文件名
+        real_filename = generate_filename(request.filename)
+        encoded_filename = quote(real_filename, encoding="utf-8")
 
-        try:
-            doc = Document(temp_input.name)
-            process_document(doc, keys, values)
+        # 3. 存入内存（2小时过期）
+        file_store[encoded_filename] = {
+            "data": word_bytes,
+            "expires": datetime.now() + timedelta(hours=2),
+            "real_name": real_filename
+        }
 
-            output_filename = generate_filename(request.template_file_url, request.filename)
-            encoded_filename = quote(output_filename, encoding="utf-8")
+        # 4. 返回下载链接
+        download_url = f"{BASE_URL}/download/{encoded_filename}"
 
-            import io
-            buffer = io.BytesIO()
-            doc.save(buffer)
-            file_bytes = buffer.getvalue()
+        return {
+            "success": True,
+            "message": "HTML 转 Word 成功",
+            "download_url": download_url,
+            "filename": real_filename
+        }
 
-            file_store[encoded_filename] = {
-                "data": file_bytes,
-                "expires": datetime.now() + timedelta(hours=2),
-                "real_name": output_filename
-            }
-
-            download_url = f"{BASE_URL}/download/{encoded_filename}"
-
-            return JSONResponse({
-                "success": True,
-                "message": "文档生成成功",
-                "full_download_url": download_url,
-                "filename": output_filename,
-                "replaced_count": len(keys)
-            })
-        finally:
-            os.unlink(temp_input.name)
-
-    except HTTPException:
-        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"生成文档失败: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"转换失败: {str(e)}")
 
 
 @app.get("/download/{filename}")
 async def download_file_endpoint(filename: str):
     filename = os.path.basename(filename)
-    if filename in file_store:
-        item = file_store[filename]
-        if datetime.now() < item["expires"]:
-            real_name = item["real_name"]
-            content_disposition = f"attachment; filename*=utf-8''{quote(real_name)}"
-            return Response(
-                content=item["data"],
-                media_type='application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-                headers={"Content-Disposition": content_disposition}
-            )
-        else:
-            del file_store[filename]
-            raise HTTPException(status_code=404, detail="文件已过期")
-    raise HTTPException(status_code=404, detail="文件不存在")
+    if filename not in file_store:
+        raise HTTPException(status_code=404, detail="文件不存在")
+
+    item = file_store[filename]
+    if datetime.now() >= item["expires"]:
+        del file_store[filename]
+        raise HTTPException(status_code=404, detail="文件已过期")
+
+    real_name = item["real_name"]
+    return JSONResponse(
+        content=item["data"],
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        headers={
+            "Content-Disposition": f"attachment; filename*=utf-8''{quote(real_name)}"
+        }
+    )
 
 
 def start_server():
     import uvicorn
     uvicorn.run(app, host=HOST, port=PORT)
-
 
 if __name__ == "__main__":
     start_server()
